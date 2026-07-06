@@ -23,8 +23,34 @@ import time
 from pathlib import Path
 
 import cv2
+import mmap
+import os
 
 import AI_shm
+
+SYS_SHM_PATH = "/dev/shm/sys_shared_memory"
+
+
+class SysSleepFlag:
+    """init.c의 /sys_shared_memory에서 sleep_flag(마지막 바이트)만 read.
+
+    sleep_flag는 SystemSharedData_t의 맨 끝 필드(그 앞=warning_flag)라서,
+    ftruncate된 파일 크기의 마지막 바이트가 곧 sleep_flag다. drowny.py가
+    여기에 STAGE_*(0~3)를 그대로 써 넣는다. uint8 단일 바이트 read는
+    원자적이므로 뮤텍스가 필요 없다. 생성/해제는 init.c 담당 -- 여기서는
+    close만 하고 unlink하지 않는다."""
+
+    def __init__(self):
+        fd = os.open(SYS_SHM_PATH, os.O_RDONLY)
+        self._size = os.fstat(fd).st_size
+        self._mm = mmap.mmap(fd, self._size, prot=mmap.PROT_READ)
+        os.close(fd)
+
+    def read(self):
+        return self._mm[self._size - 1]   # 마지막 바이트 == sleep_flag
+
+    def close(self):
+        self._mm.close()
 
 DISPLAY_INTERVAL_S = 0.15      # latest.jpg 재로드 주기
 STATE_PRINT_INTERVAL_S = 0.5   # 상태값 콘솔 출력 주기 (창 갱신과는 별개)
@@ -50,6 +76,18 @@ STAGE_LABELS = {
     STAGE_WARNING: ("EYES CLOSING", (0, 165, 255)),
     STAGE_DROWSY: ("DROWSY", (0, 0, 255)),
 }
+
+# sleep_flag(=init.c로 반영된 stage) 콘솔 출력용 이름
+SLEEP_FLAG_NAME = {
+    STAGE_NO_FACE: "NO_FACE",
+    STAGE_NORMAL: "NORMAL",
+    STAGE_WARNING: "WARNING",
+    STAGE_DROWSY: "DROWSY",
+}
+
+
+def sleep_flag_name(v):
+    return SLEEP_FLAG_NAME.get(v, "?(%s)" % v)
 
 
 def draw_landmarks(frame, lm_state, img_w, img_h):
@@ -107,7 +145,7 @@ def draw_overlay(frame, status):
     return out
 
 
-def run_with_window(lm_reader, status_reader):
+def run_with_window(lm_reader, status_reader, sys_flag):
     """cv2 창에 latest.jpg + 상태 오버레이 + 눈 랜드마크를 합성해서 표시."""
     print(f"[gui] displaying {LATEST_IMAGE_PATH} in window "
           f"'{WINDOW_NAME}' (press 'q' to quit)", file=sys.stderr)
@@ -135,11 +173,12 @@ def run_with_window(lm_reader, status_reader):
         now = time.time()
         if now - last_state_print >= STATE_PRINT_INTERVAL_S:
             status = status_reader.read()
+            sf = sys_flag.read() if sys_flag else None
             if status is not None:
                 print(
                     f"[gui] ear={status['ear']:.3f} "
                     f"stage={status['stage']} "
-                    f"face_detected={status['face_detected']} "
+                    f"sleep_flag={sleep_flag_name(sf) if sf is not None else 'n/a'} "
                     f"closed={status['closed_duration_s']:.2f}s"
                 )
             last_state_print = now
@@ -152,13 +191,14 @@ def run_with_window(lm_reader, status_reader):
     cv2.destroyAllWindows()
 
 
-def run_text_only(lm_reader, status_reader):
+def run_text_only(lm_reader, status_reader, sys_flag):
     """디스플레이 없는 환경(SSH 헤드리스)용 폴백: 텍스트만 출력."""
     print("[gui] no-window mode: printing text status only", file=sys.stderr)
     try:
         while True:
             status = status_reader.read()
             lm_state = lm_reader.read()
+            sf = sys_flag.read() if sys_flag else None
 
             if LATEST_IMAGE_PATH.exists():
                 img_age = time.time() - LATEST_IMAGE_PATH.stat().st_mtime
@@ -176,7 +216,7 @@ def run_text_only(lm_reader, status_reader):
                 print(
                     f"[gui] ear={status['ear']:.3f} "
                     f"stage={status['stage']} "
-                    f"face_detected={status['face_detected']} "
+                    f"sleep_flag={sleep_flag_name(sf) if sf is not None else 'n/a'} "
                     f"closed={status['closed_duration_s']:.2f}s "
                     f"| {img_status} | {lm_status}"
                 )
@@ -210,19 +250,32 @@ def main():
 
     print("[gui] AI_shm(landmark/status) attach done", file=sys.stderr)
 
+    # init.c 시스템 공유 메모리의 sleep_flag 리더. 없어도(=init_task 미실행)
+    # 카메라 오버레이는 계속 동작하고 sleep_flag만 'n/a'로 표시한다.
+    try:
+        sys_flag = SysSleepFlag()
+        print("[gui] attached to /sys_shared_memory (sleep_flag)",
+              file=sys.stderr)
+    except FileNotFoundError:
+        sys_flag = None
+        print("[gui] /sys_shared_memory not found; sleep_flag shows 'n/a'. "
+              "Is init_task running?", file=sys.stderr)
+
     try:
         if args.no_window:
-            run_text_only(lm_reader, status_reader)
+            run_text_only(lm_reader, status_reader, sys_flag)
         else:
             try:
-                run_with_window(lm_reader, status_reader)
+                run_with_window(lm_reader, status_reader, sys_flag)
             except cv2.error as e:
                 print(f"[gui] cv2 window failed ({e}); "
                       f"falling back to text-only mode", file=sys.stderr)
-                run_text_only(lm_reader, status_reader)
+                run_text_only(lm_reader, status_reader, sys_flag)
     finally:
         lm_reader.close()      # attach만 했으므로 unlink는 AI_init 몫
         status_reader.close()  # attach만 했으므로 unlink는 AI_init 몫
+        if sys_flag:
+            sys_flag.close()   # attach만 했으므로 unlink는 init.c 몫
 
 
 if __name__ == "__main__":
