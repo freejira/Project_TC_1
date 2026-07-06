@@ -28,7 +28,7 @@ import AI_shm
 # init.c의 SystemSharedData_t 미러
 # ---------------------------------------------------------------------------
 SYS_SHM_NAME = "/sys_shared_memory"
-MUTEX_SIZE = 40   # sizeof(pthread_mutex_t) 확인 후 맞출 것
+MUTEX_SIZE = 48   # sizeof(pthread_mutex_t) 확인 후 맞출 것
 
 
 class PthreadMutexRaw(ctypes.Structure):
