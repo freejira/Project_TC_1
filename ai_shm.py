@@ -1,221 +1,306 @@
-"""ai_shm.py: ai_shm.hpp와 바이트 레벨로 1:1 맞춘 파이썬 공유 메모리 계층.
+"""AI_shm.py: AI_c 파이프라인(cam / check_eye / drowny / ai_GUI)이 공유하는
+POSIX 공유메모리 레이어. ctypes.Structure로 mmap 버퍼를 직접 매핑해서,
+struct.pack_into/unpack_from 없이 "진짜 구조체 필드 접근"(data.landmark.ear
+같은 식)이 되도록 만들었다.
 
-역할 분담(파이썬 쪽에서 실제로 쓰는 것):
-  - FrameReader   : cam(C++)이 ai_frame_shm에 쓴 BGR 프레임을 읽음
-  - LandmarkWriter: eye_seeker가 눈 12점 좌표를 ai_landmark_shm에 씀
-(status 블록은 drowsy(C++)와 ai_GUI(C++)만 다루므로 파이썬에는 reader만 참고용으로 둠)
+위치: 코드 전체가 모여있는 폴더 (예: ~/my/AI/AI_shm.py)
 
-중요 - POSIX shm 직접 mmap:
-  C++ 쪽은 shm_open("/ai_frame_shm", ...)을 쓴다. 리눅스에서 POSIX shm은
-  /dev/shm/<name> 파일로 노출되므로, 파이썬에서 multiprocessing.shared_memory
-  대신 /dev/shm/ai_frame_shm 파일을 직접 open+mmap 하면 C++와 100% 동일한
-  메모리에 접근한다. (multiprocessing.shared_memory는 이름 앞 '/' 처리가
-  버전마다 달라 hpp와 어긋날 위험이 있어 피한다.)
+** face_detected는 이 블록에 없음 **
+얼굴 검출 여부는 stage(STAGE_NO_FACE=0)로 이미 표현되므로 별도 필드로
+중복 저장하지 않는다. init.c 쪽 SystemSharedData_t의 sleep_flag가
+최상위 졸음 상태를 대표하고, 여기 status 섹션은 GUI 디버깅용 상세 값
+(ear/stage/closed_duration_s/timestamp)만 담당한다.
 
-레이아웃은 ai_shm.hpp의 #pragma pack(push,1) 구조체와 정확히 일치해야 한다.
-struct 포맷 문자열은 리틀엔디언+패딩없음('<')으로 고정한다 (aarch64 리틀엔디언).
+** POSIX shm_open 방식 (System V IPC 아님) **
+Qt6 GUI 쪽에서 QSharedMemory 대신 shm_open/mmap을 쓰기로 한 이유와 동일:
+QSharedMemory는 System V IPC 기반이라 우리가 쓰는 POSIX 방식(shm_open,
+결국 리눅스에서는 /dev/shm/<name> 파일을 여는 것과 동일)과 바이트 레벨로
+호환되지 않는다. `shmid_ds`/`shmget`/`shmctl` 같은 System V API는 여기서
+전혀 쓰지 않는다 -- 그건 커널이 관리하는 세그먼트 메타데이터(권한, attach
+카운트 등)를 위한 구조체지, 우리 데이터(눈 좌표/EAR/졸음 단계)를 담는
+자리가 아니다.
+
+** 단일 블록 구조 **
+랜드마크(check_eye가 씀)와 상태(drowny가 씀)를 별도 shm 두 개로 나누지
+않고, `/dev/shm/AI_shm` 하나에 `AiSharedData` 구조체 하나로 관리한다.
+그 안에 `landmark`, `status` 두 개의 하위 섹션이 있고, 각 섹션은 독립된
+`seq` 필드를 갖는다 (writer가 서로 다른 프로세스이므로 섹션끼리 seqlock을
+공유하면 안 됨).
+
+** 소유권 모델 **
+이 블록의 생성(create)과 해제(unlink)는 **AI_init만** 한다.
+cam/check_eye/drowny/ai_GUI는 전부 attach만 하고, close()만 호출한다
+(unlink 안 함).
+
+** multiprocessing.shared_memory를 안 쓰는 이유 **
+독립 프로세스(부모-자식 관계 아님)가 각자 attach만 해도, Python의
+resource_tracker가 attach한 프로세스 기준으로 정리를 시도해서 실제
+소유자가 아닌 프로세스가 죽을 때 shm이 사라지는 예측 불가능한 상황이
+생길 수 있다. 그래서 raw `os.open` + `mmap`으로 `/dev/shm/<name>`을
+직접 다룬다.
+
+** 동시성: seqlock (섹션별 독립) **
+독립 프로세스 간에는 `multiprocessing.Lock`을 상속할 수 없으므로, 커널 락
+없는 seqlock 패턴을 쓴다:
+  - writer: seq를 홀수로 올림(쓰기 시작) -> 필드 기록 -> seq를 다음
+    짝수로 올림(쓰기 완료)
+  - reader: seq를 읽어(짝수여야 안정 상태) 필드를 읽고 seq를 다시 읽어서
+    바뀌었거나 홀수였으면 재시도.
+  - 모든 구조체에 `_pack_ = 1`을 지정해서 정렬 패딩을 없앴다. 이렇게 하면
+    C/C++ 쪽에서 동일한 필드 순서 + `#pragma pack(push,1)`로 정의한
+    struct와 바이트 레벨로 그대로 호환된다.
+
+** 섹션 목록 **
+  - landmark : check_eye(writer) -> drowny/ai_GUI(reader)
+      눈 랜드마크 12점(오른쪽 6 + 왼쪽 6) 픽셀 좌표 + 프레임 크기 + valid
+  - status   : drowny(writer) -> ai_GUI(reader)
+      EAR / 졸음 단계(stage) / 눈 감김 지속시간 / timestamp
 """
 
+import ctypes
 import mmap
 import os
-import struct
-import time
-
-# ---------------------------------------------------------------------------
-# 공통 상수 (hpp와 동일해야 함)
-# ---------------------------------------------------------------------------
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
-FRAME_CHANNELS = 3
-FRAME_BYTES = FRAME_WIDTH * FRAME_HEIGHT * FRAME_CHANNELS  # 921600
-
-NUM_EYE_POINTS = 12  # 오른쪽 눈 6 + 왼쪽 눈 6
 
 SHM_DIR = "/dev/shm"
+AI_SHM_NAME = "AI_shm"
 
-# 블록 이름 (hpp의 k*ShmName에서 앞의 '/' 뗀 것 == /dev/shm 아래 파일명)
-FRAME_SHM_NAME = "ai_frame_shm"
-LANDMARK_SHM_NAME = "ai_landmark_shm"
-STATUS_SHM_NAME = "ai_status_shm"
-
-# ---- FRAME 블록 레이아웃 ----
-# [ active_index : uint32 ][ slot0 ][ slot1 ]
-# slot = FrameHeader + pixels(FRAME_BYTES)
-# FrameHeader(hpp): double ts, uint32 seq, uint16 w, uint16 h, uint8 ch  (pack=1)
-_FRAME_HEADER_FMT = "<dIHHB"
-_FRAME_HEADER_SIZE = struct.calcsize(_FRAME_HEADER_FMT)  # 17
-assert _FRAME_HEADER_SIZE == 17, _FRAME_HEADER_SIZE
-_FRAME_SLOT_SIZE = _FRAME_HEADER_SIZE + FRAME_BYTES
-_FRAME_SHM_SIZE = 4 + 2 * _FRAME_SLOT_SIZE
-_ACTIVE_INDEX_OFF = 0
-
-# ---- LANDMARK 블록 레이아웃 ----
-# [ seq : uint32 ][ LandmarkHeader ][ points : 12*(x,y) float ]
-# LandmarkHeader(hpp): double ts, uint8 valid, uint16 frame_w, uint16 frame_h (pack=1)
-_LM_SEQ_FMT = "<I"
-_LM_SEQ_SIZE = 4
-_LM_HEADER_FMT = "<dBHH"
-_LM_HEADER_SIZE = struct.calcsize(_LM_HEADER_FMT)  # 13
-assert _LM_HEADER_SIZE == 13, _LM_HEADER_SIZE
-_LM_POINTS_FMT = "<%df" % (NUM_EYE_POINTS * 2)
-_LM_POINTS_SIZE = struct.calcsize(_LM_POINTS_FMT)  # 96
-_LM_HEADER_OFF = _LM_SEQ_SIZE
-_LM_POINTS_OFF = _LM_HEADER_OFF + _LM_HEADER_SIZE
-_LANDMARK_SHM_SIZE = _LM_SEQ_SIZE + _LM_HEADER_SIZE + _LM_POINTS_SIZE  # 113
-
-# ---- STATUS 블록 레이아웃 (파이썬은 참고용 reader만) ----
-# [ seq : uint32 ][ StatusPayload ]
-# StatusPayload(hpp): double ts, float ear, uint8 stage, float closed_duration (pack=1)
-_ST_SEQ_SIZE = 4
-_ST_PAYLOAD_FMT = "<dfBf"
-_ST_PAYLOAD_SIZE = struct.calcsize(_ST_PAYLOAD_FMT)  # 17
-assert _ST_PAYLOAD_SIZE == 17, _ST_PAYLOAD_SIZE
-_STATUS_SHM_SIZE = _ST_SEQ_SIZE + _ST_PAYLOAD_SIZE  # 21
-
-STAGE_NAMES = {0: "NORMAL", 1: "WARNING", 2: "DROWSY", 3: "NO_FACE"}
+MAX_READ_RETRIES = 5
 
 
 # ---------------------------------------------------------------------------
-# 내부 공용: /dev/shm/<name> 을 열고 mmap 하는 헬퍼
+# 구조체 정의 -- 여기가 C 쪽 struct와 1:1로 맞춰야 하는 부분.
+# _pack_ = 1 필수 (안 하면 컴파일러/아키텍처에 따라 패딩이 들어갈 수 있음).
 # ---------------------------------------------------------------------------
-def _open_existing(name, size):
-    """기존 블록(다른 프로세스가 create)에 attach. 없으면 FileNotFoundError."""
-    path = os.path.join(SHM_DIR, name)
-    fd = os.open(path, os.O_RDWR)  # 읽기+쓰기로 열되, reader는 읽기만 사용
-    try:
-        return mmap.mmap(fd, size, mmap.MAP_SHARED,
-                         mmap.PROT_READ | mmap.PROT_WRITE)
-    finally:
-        os.close(fd)  # mmap 후 fd는 닫아도 매핑 유지됨
+
+class Point(ctypes.Structure):
+    """눈 랜드마크 한 점의 픽셀 좌표."""
+    _pack_ = 1
+    _fields_ = [
+        ("x", ctypes.c_float),
+        ("y", ctypes.c_float),
+    ]
 
 
-def _create(name, size):
-    """새 블록 생성(zero-init). 이 이름의 writer가 파이썬인 경우에만 사용."""
-    path = os.path.join(SHM_DIR, name)
+class LandmarkSection(ctypes.Structure):
+    """check_eye(writer) -> drowny/ai_GUI(reader).
+    seq: 홀수=쓰기 중, 짝수=안정 상태 (seqlock, 이 섹션 전용)."""
+    _pack_ = 1
+    _fields_ = [
+        ("seq", ctypes.c_uint32),
+        ("valid", ctypes.c_uint8),
+        ("frame_w", ctypes.c_uint16),
+        ("frame_h", ctypes.c_uint16),
+        ("right_eye", Point * 6),   # eye_seeker.py의 RIGHT_EYE 순서
+        ("left_eye", Point * 6),    # eye_seeker.py의 LEFT_EYE 순서
+    ]
+
+
+class StatusSection(ctypes.Structure):
+    """drowny(writer) -> ai_GUI(reader). seq: landmark와 독립된 별도 seqlock.
+    얼굴 검출 여부는 stage(STAGE_NO_FACE=0)로 표현하므로 별도 필드 없음."""
+    _pack_ = 1
+    _fields_ = [
+        ("seq", ctypes.c_uint32),
+        ("timestamp", ctypes.c_double),
+        ("ear", ctypes.c_float),
+        ("stage", ctypes.c_uint8),
+        ("closed_duration_s", ctypes.c_float),
+    ]
+
+
+class AiSharedData(ctypes.Structure):
+    """AI_shm 블록 전체 레이아웃 -- 이 구조체 하나가 /dev/shm/AI_shm에
+    그대로 매핑된다."""
+    _pack_ = 1
+    _fields_ = [
+        ("landmark", LandmarkSection),
+        ("status", StatusSection),
+    ]
+
+
+AI_SHM_SIZE = ctypes.sizeof(AiSharedData)
+
+
+# ---------------------------------------------------------------------------
+# 저수준 헬퍼 -- 생성/attach/해제 (AI_init 전용: create_ai_shm/unlink_ai_shm)
+# ---------------------------------------------------------------------------
+
+def _shm_path(name):
+    return os.path.join(SHM_DIR, name)
+
+
+def create_ai_shm():
+    """AI_shm 블록을 생성하고 0으로 초기화한다 (AI_init 전용).
+    이전 실행이 비정상 종료해서 파일이 남아있어도 재사용 + 0으로 덮어써서
+    안전하게 재초기화한다."""
+    path = _shm_path(AI_SHM_NAME)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
     try:
-        os.ftruncate(fd, size)
-        mm = mmap.mmap(fd, size, mmap.MAP_SHARED,
-                       mmap.PROT_READ | mmap.PROT_WRITE)
+        os.ftruncate(fd, AI_SHM_SIZE)
+        mm = mmap.mmap(fd, AI_SHM_SIZE)
+        mm[:] = bytes(AI_SHM_SIZE)
+        mm.flush()
     finally:
-        os.close(fd)
-    mm[:size] = b"\x00" * size
+        os.close(fd)  # mmap이 매핑을 유지하므로 원본 fd는 닫아도 무방
     return mm
 
 
-def _load_seq(mm, off=0):
-    return struct.unpack_from("<I", mm, off)[0]
+def open_ai_shm():
+    """이미 생성되어 있는 AI_shm 블록에 attach (생성/재초기화 없음)."""
+    path = _shm_path(AI_SHM_NAME)
+    fd = os.open(path, os.O_RDWR)
+    try:
+        mm = mmap.mmap(fd, AI_SHM_SIZE)
+    finally:
+        os.close(fd)
+    return mm
 
 
-# ===========================================================================
-# FRAME 블록 reader  (cam(C++)이 writer)
-# ===========================================================================
-class FrameReader:
-    """cam(C++)이 ai_frame_shm에 쓴 최신 BGR 프레임을 읽는다.
-
-    반환은 numpy 배열이 아니라 (bytes, header dict)로, 호출자가 원하는 방식으로
-    변환하게 둔다. eye_seeker.py에서 numpy.frombuffer로 감싸 cv2에 넘긴다.
-    """
-
-    def __init__(self):
-        self._mm = _open_existing(FRAME_SHM_NAME, _FRAME_SHM_SIZE)
-
-    def read(self):
-        """최신 프레임을 (pixels_bytes, meta) 로 반환. 유효 프레임 없으면 None.
-
-        meta = {timestamp, seq, width, height, channels}
-        """
-        idx = struct.unpack_from("<I", self._mm, _ACTIVE_INDEX_OFF)[0]
-        if idx > 1:
-            return None  # 아직 아무도 안 씀
-        slot_off = 4 + idx * _FRAME_SLOT_SIZE
-        ts, seq, w, h, ch = struct.unpack_from(_FRAME_HEADER_FMT, self._mm, slot_off)
-        if seq == 0:
-            return None
-        px_off = slot_off + _FRAME_HEADER_SIZE
-        pixels = self._mm[px_off:px_off + FRAME_BYTES]
-        meta = {"timestamp": ts, "seq": seq,
-                "width": w, "height": h, "channels": ch}
-        return pixels, meta
-
-    def close(self):
-        self._mm.close()
+def unlink_ai_shm():
+    """블록 이름 자체를 제거 (AI_init 전용, 종료 시 호출)."""
+    try:
+        os.unlink(_shm_path(AI_SHM_NAME))
+    except FileNotFoundError:
+        pass
 
 
-# ===========================================================================
-# LANDMARK 블록 writer  (eye_seeker가 writer -> 이 프로세스가 소유/생성)
-# ===========================================================================
+def _attach_data():
+    """mmap을 열고 그 위에 AiSharedData를 얹는다. mmap 객체를 함께 반환하는
+    이유: mmap이 GC되면 매핑도 해제되므로, ctypes 구조체보다 오래 살아있게
+    붙잡아둬야 함 (Writer/Reader가 self._mm으로 참조 유지)."""
+    mm = open_ai_shm()
+    data = AiSharedData.from_buffer(mm)
+    return mm, data
+
+
+# ---------------------------------------------------------------------------
+# landmark 섹션: writer/reader (attach 전용 -- check_eye/drowny/GUI가 사용)
+# ---------------------------------------------------------------------------
+
 class LandmarkWriter:
-    """눈 12점 좌표(오른쪽 6 + 왼쪽 6)를 ai_landmark_shm에 seqlock으로 쓴다.
+    """landmark 섹션에 attach해서 쓰는 writer (check_eye가 사용).
+    생성/해제는 AI_init 담당 -- close()는 mmap만 닫고 unlink하지 않는다."""
 
-    소유권: eye_seeker가 이 블록의 writer이므로 create + 종료 시 unlink 담당.
-    """
+    def __init__(self):
+        self._mm, self._data = _attach_data()
 
-    def __init__(self, create=True):
-        if create:
-            self._mm = _create(LANDMARK_SHM_NAME, _LANDMARK_SHM_SIZE)
-            self._owner = True
-        else:
-            self._mm = _open_existing(LANDMARK_SHM_NAME, _LANDMARK_SHM_SIZE)
-            self._owner = False
+    def write_valid(self, points, w, h):
+        """points: (x, y) 픽셀 좌표 12개, 순서는 오른쪽 눈 6 + 왼쪽 눈 6
+        (eye_seeker.py의 RIGHT_EYE + LEFT_EYE 인덱스와 동일 순서)."""
+        if len(points) != 12:
+            raise ValueError(f"expected 12 points, got {len(points)}")
+        d = self._data.landmark
+        d.seq += 1  # 홀수 -> 쓰기 시작
+        for i in range(6):
+            d.right_eye[i].x, d.right_eye[i].y = points[i]
+        for i in range(6):
+            d.left_eye[i].x, d.left_eye[i].y = points[6 + i]
+        d.frame_w = w
+        d.frame_h = h
+        d.valid = 1
+        d.seq += 1  # 짝수 -> 쓰기 완료
 
-    def write_valid(self, points, frame_w, frame_h):
-        """points: (x, y) 12개 리스트 (오른쪽 눈 6 다음 왼쪽 눈 6)."""
-        self._write(True, points, frame_w, frame_h)
-
-    def write_invalid(self, frame_w, frame_h):
-        """얼굴/눈 미검출 프레임. 좌표는 0으로 채움."""
-        self._write(False, None, frame_w, frame_h)
-
-    def _write(self, valid, points, frame_w, frame_h):
-        seq = _load_seq(self._mm, 0)
-        # 1) 홀수: 쓰기 중
-        struct.pack_into("<I", self._mm, 0, (seq + 1) & 0xFFFFFFFF)
-        # 2) header
-        struct.pack_into(_LM_HEADER_FMT, self._mm, _LM_HEADER_OFF,
-                         time.time(), 1 if valid else 0,
-                         int(frame_w) & 0xFFFF, int(frame_h) & 0xFFFF)
-        # 3) points (flatten, invalid면 0)
-        if valid and points is not None:
-            flat = []
-            for x, y in points:
-                flat.append(float(x))
-                flat.append(float(y))
-        else:
-            flat = [0.0] * (NUM_EYE_POINTS * 2)
-        struct.pack_into(_LM_POINTS_FMT, self._mm, _LM_POINTS_OFF, *flat)
-        # 4) 짝수: 안정
-        struct.pack_into("<I", self._mm, 0, (seq + 2) & 0xFFFFFFFF)
+    def write_invalid(self, w, h):
+        """이번 프레임에 얼굴이 검출되지 않았을 때 호출. 좌표는 0으로 채움."""
+        d = self._data.landmark
+        d.seq += 1
+        for i in range(6):
+            d.right_eye[i].x = 0.0
+            d.right_eye[i].y = 0.0
+            d.left_eye[i].x = 0.0
+            d.left_eye[i].y = 0.0
+        d.frame_w = w
+        d.frame_h = h
+        d.valid = 0
+        d.seq += 1
 
     def close(self):
         self._mm.close()
-        if self._owner:
-            path = os.path.join(SHM_DIR, LANDMARK_SHM_NAME)
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
 
 
-# ===========================================================================
-# STATUS 블록 reader  (참고용 -- 실제 writer는 drowsy(C++))
-# ===========================================================================
-class StatusReader:
+class LandmarkReader:
+    """landmark 섹션에 attach해서 읽는 reader (drowny/ai_GUI가 사용)."""
+
     def __init__(self):
-        self._mm = _open_existing(STATUS_SHM_NAME, _STATUS_SHM_SIZE)
+        self._mm, self._data = _attach_data()
 
-    def read(self, max_retries=8):
+    def read(self, max_retries=MAX_READ_RETRIES):
+        """일관된 스냅샷을 dict로 반환. writer가 계속 쓰는 중이라 안정적인
+        읽기를 못 얻으면 None (호출 측에서 다음 tick에 재시도할 것)."""
+        d = self._data.landmark
         for _ in range(max_retries):
-            s1 = _load_seq(self._mm, 0)
-            if s1 & 1:
+            seq1 = d.seq
+            if seq1 % 2 == 1:
+                continue  # writer가 쓰는 중
+            valid = d.valid
+            frame_w = d.frame_w
+            frame_h = d.frame_h
+            right_eye = [(p.x, p.y) for p in d.right_eye]
+            left_eye = [(p.x, p.y) for p in d.left_eye]
+            seq2 = d.seq
+            if seq1 != seq2:
+                continue  # 읽는 도중 write 발생 -> torn read, 재시도
+            return {
+                "valid": bool(valid),
+                "frame_w": frame_w,
+                "frame_h": frame_h,
+                "right_eye": right_eye,
+                "left_eye": left_eye,
+            }
+        return None
+
+    def close(self):
+        self._mm.close()
+
+
+# ---------------------------------------------------------------------------
+# status 섹션: writer/reader (attach 전용 -- drowny가 쓰고, ai_GUI가 읽음)
+# ---------------------------------------------------------------------------
+
+class StatusWriter:
+    """status 섹션에 attach해서 쓰는 writer (drowny가 사용)."""
+
+    def __init__(self):
+        self._mm, self._data = _attach_data()
+
+    def write(self, ear, stage, closed_duration_s, timestamp):
+        d = self._data.status
+        d.seq += 1
+        d.timestamp = timestamp
+        d.ear = ear
+        d.stage = stage
+        d.closed_duration_s = closed_duration_s
+        d.seq += 1
+
+    def close(self):
+        self._mm.close()
+
+
+class StatusReader:
+    """status 섹션에 attach해서 읽는 reader (ai_GUI가 사용)."""
+
+    def __init__(self):
+        self._mm, self._data = _attach_data()
+
+    def read(self, max_retries=MAX_READ_RETRIES):
+        d = self._data.status
+        for _ in range(max_retries):
+            seq1 = d.seq
+            if seq1 % 2 == 1:
                 continue
-            ts, ear, stage, closed = struct.unpack_from(
-                _ST_PAYLOAD_FMT, self._mm, _ST_SEQ_SIZE)
-            s2 = _load_seq(self._mm, 0)
-            if s1 == s2:
-                return {"timestamp": ts, "ear": ear,
-                        "stage": stage, "stage_name": STAGE_NAMES.get(stage, "?"),
-                        "closed_duration": closed}
+            timestamp = d.timestamp
+            ear = d.ear
+            stage = d.stage
+            closed_duration_s = d.closed_duration_s
+            seq2 = d.seq
+            if seq1 != seq2:
+                continue
+            return {
+                "timestamp": timestamp,
+                "ear": ear,
+                "stage": stage,
+                "closed_duration_s": closed_duration_s,
+            }
         return None
 
     def close(self):
