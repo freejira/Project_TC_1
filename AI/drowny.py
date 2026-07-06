@@ -1,282 +1,248 @@
-"""gui.py: latest.jpg 위에 EAR/상태 오버레이와 눈 랜드마크 점을 그려서
-디버깅용 라이브 화면으로 보여준다.
+"""drowny.py: AI_shm의 landmark 섹션에서 눈 랜드마크 좌표를 읽어 EAR을
+계산하고, 벽시계 시간 기반으로 졸음을 판정해 AI_shm의 status 섹션에
+기록한다. 판정이 바뀌는 시점(rising/falling edge)에 Main STM32로
+경고/감속 요청 및 해제 신호를 보낸다.
 
-위치: 코드 전체가 모여있는 폴더 (예: ~/my/AI/gui.py)
-실행: <코드 폴더>/drowsy_env_312/bin/python gui.py
+위치: 코드 전체가 모여있는 폴더 (예: ~/my/AI/drowny.py)
+실행: <코드 폴더>/drowsy_env_312/bin/python drowny.py
 
 책임 범위:
-  - 하는 일: latest.jpg 로드 -> AI_shm(landmark/status) 읽기 -> 오버레이
-    합성 -> 화면 표시 (또는 --no-window 시 텍스트 출력)
+  - 하는 일: 랜드마크 읽기 -> EAR 계산 -> 눈 감김 지속시간 판정 ->
+    상태 write -> (rising/falling edge에서) STM32에 경고/해제 전송
 
 AI_shm 사용 범위: landmark 섹션을 읽고(AI_shm.LandmarkReader), status
-섹션을 읽음(AI_shm.StatusReader). 둘 다 attach만 하고 close()는 mmap만
-닫는다 (unlink는 AI_init 몫).
-
-NOTE: 디스플레이(X11/Wayland)가 있는 환경에서만 창 모드가 동작함. SSH로
-헤드리스 접속 중이면 cv2.imshow가 실패하므로, 그 경우 --no-window 옵션으로
-텍스트 출력만 하는 방식으로 폴백함.
+섹션에 씀(AI_shm.StatusWriter). 생성/해제는 AI_init 담당 -- close()는
+mmap만 닫고 unlink하지 않는다.
 """
 
-import argparse
-import sys
-import time
-from pathlib import Path
-
-import cv2
+import ctypes
 import mmap
 import os
+import signal
+import sys
+import time
 
 import AI_shm
 
-SYS_SHM_PATH = "/dev/shm/sys_shared_memory"
+# ---------------------------------------------------------------------------
+# init.c의 SystemSharedData_t 미러
+# ---------------------------------------------------------------------------
+SYS_SHM_NAME = "/sys_shared_memory"
+MUTEX_SIZE = 40   # sizeof(pthread_mutex_t) 확인 후 맞출 것
 
 
-class SysSleepFlag:
-    """init.c의 /sys_shared_memory에서 sleep_flag(마지막 바이트)만 read.
+class PthreadMutexRaw(ctypes.Structure):
+    _fields_ = [("_opaque", ctypes.c_uint8 * MUTEX_SIZE)]
 
-    sleep_flag는 SystemSharedData_t의 맨 끝 필드(그 앞=warning_flag)라서,
-    ftruncate된 파일 크기의 마지막 바이트가 곧 sleep_flag다. drowny.py가
-    여기에 STAGE_*(0~3)를 그대로 써 넣는다. uint8 단일 바이트 read는
-    원자적이므로 뮤텍스가 필요 없다. 생성/해제는 init.c 담당 -- 여기서는
-    close만 하고 unlink하지 않는다."""
 
+class SystemSharedData(ctypes.Structure):
+    _fields_ = [
+        ("mutex", PthreadMutexRaw),
+        ("system_state", ctypes.c_int),
+        ("module_type", ctypes.c_int),
+        ("latest_fault", ctypes.c_int),
+        ("module_id", ctypes.c_uint32),
+        ("dock_detected", ctypes.c_uint8),
+        ("auth_result", ctypes.c_uint8),
+        ("power_granted", ctypes.c_uint8),
+        ("module_function_enabled", ctypes.c_uint8),
+        ("target_speed_rpm", ctypes.c_float),
+        ("current_speed_rpm", ctypes.c_float),
+        ("motor_pwm_duty", ctypes.c_uint16),
+        ("requested_power_w", ctypes.c_float),
+        ("granted_power_w", ctypes.c_float),
+        ("reported_power_w", ctypes.c_float),
+        ("power_violation_count", ctypes.c_uint8),
+        ("pressure_value", ctypes.c_float),
+        ("target_temp_c", ctypes.c_float),
+        ("current_temp_c", ctypes.c_float),
+        ("peltier_pwm", ctypes.c_uint8),
+        ("fan_pwm", ctypes.c_uint8),
+        ("warning_flag", ctypes.c_uint8),
+        ("sleep_flag", ctypes.c_uint8),
+    ]
+
+
+libpthread = ctypes.CDLL("libpthread.so.0", use_errno=True)
+
+
+class SysShmClient:
     def __init__(self):
-        fd = os.open(SYS_SHM_PATH, os.O_RDONLY)
-        self._size = os.fstat(fd).st_size
-        self._mm = mmap.mmap(fd, self._size, prot=mmap.PROT_READ)
-        os.close(fd)
+        path = "/dev/shm" + SYS_SHM_NAME
+        self._fd = os.open(path, os.O_RDWR)
+        size = ctypes.sizeof(SystemSharedData)
+        self._mm = mmap.mmap(self._fd, size)
+        os.close(self._fd)
+        self._data = SystemSharedData.from_buffer(self._mm)
 
-    def read(self):
-        return self._mm[self._size - 1]   # 마지막 바이트 == sleep_flag
+    def _lock(self):
+        libpthread.pthread_mutex_lock(ctypes.byref(self._data.mutex))
+
+    def _unlock(self):
+        libpthread.pthread_mutex_unlock(ctypes.byref(self._data.mutex))
+
+    def set_flags(self, warning: bool, stage: int):
+        # sleep_flag에는 drowny stage(STAGE_*, 0~3)를 그대로 기록한다.
+        # 주의: 소비 측(C/STM32)은 sleep_flag를 0/1 불리언이 아니라
+        # 0~3 단계값으로 읽어야 한다 (졸음 판정은 sleep_flag == STAGE_DROWSY(3)).
+        self._lock()
+        try:
+            self._data.warning_flag = 1 if warning else 0
+            self._data.sleep_flag = int(stage) & 0xFF
+        finally:
+            self._unlock()
 
     def close(self):
         self._mm.close()
 
-DISPLAY_INTERVAL_S = 0.15      # latest.jpg 재로드 주기
-STATE_PRINT_INTERVAL_S = 0.5   # 상태값 콘솔 출력 주기 (창 갱신과는 별개)
 
-AI_DIR = Path(__file__).resolve().parent
-LOGS_DIR = AI_DIR / "logs"
-LATEST_IMAGE_PATH = LOGS_DIR / "latest.jpg"
-WINDOW_NAME = "Drowsiness Monitor (debug)"
+# ---------------------------------------------------------------------------
+# 튜닝 파라미터
+# ---------------------------------------------------------------------------
+EAR_THRESHOLD = 0.21
+EYES_CLOSED_DURATION_S = 3.0
+POLL_INTERVAL_S = 0.05
 
-EYE_POINT_RADIUS = 2
-EYE_POINT_COLOR = (0, 255, 255)     # yellow dots on each landmark
-EYE_LINE_COLOR = (255, 255, 0)      # cyan contour connecting the 6 points
-
-# drowny.py와 합의된 stage 코드
 STAGE_NO_FACE = 0
 STAGE_NORMAL = 1
 STAGE_WARNING = 2
 STAGE_DROWSY = 3
 
-STAGE_LABELS = {
-    STAGE_NO_FACE: ("NO FACE", (0, 165, 255)),
-    STAGE_NORMAL: ("FACE OK", (0, 200, 0)),
-    STAGE_WARNING: ("EYES CLOSING", (0, 165, 255)),
-    STAGE_DROWSY: ("DROWSY", (0, 0, 255)),
-}
-
-# sleep_flag(=init.c로 반영된 stage) 콘솔 출력용 이름
-SLEEP_FLAG_NAME = {
-    STAGE_NO_FACE: "NO_FACE",
-    STAGE_NORMAL: "NORMAL",
-    STAGE_WARNING: "WARNING",
-    STAGE_DROWSY: "DROWSY",
-}
+_running = True
 
 
-def sleep_flag_name(v):
-    return SLEEP_FLAG_NAME.get(v, "?(%s)" % v)
+def _handle_sigterm(signum, frame):
+    global _running
+    _running = False
 
 
-def draw_landmarks(frame, lm_state, img_w, img_h):
-    """눈 랜드마크 12개 포인트를 이미지 위에 점 + 윤곽선으로 그림.
-
-    lm_state: LandmarkReader.read()의 결과. frame_w/frame_h는 캡처 당시
-    해상도이므로, latest.jpg가 다른 해상도로 로드된 경우를 대비해 스케일
-    보정을 한다 (보통은 동일해서 scale=1.0).
-    """
-    if lm_state is None or not lm_state["valid"]:
-        return frame
-
-    out = frame
-    scale_x = img_w / lm_state["frame_w"] if lm_state["frame_w"] else 1.0
-    scale_y = img_h / lm_state["frame_h"] if lm_state["frame_h"] else 1.0
-
-    for eye_pts in (lm_state["right_eye"], lm_state["left_eye"]):
-        scaled = [(int(x * scale_x), int(y * scale_y)) for x, y in eye_pts]
-        for pt in scaled:
-            cv2.circle(out, pt, EYE_POINT_RADIUS, EYE_POINT_COLOR, -1)
-        # 6개 점을 순서대로 이어서 눈 윤곽선처럼 표시 (폐곡선)
-        for i in range(len(scaled)):
-            cv2.line(out, scaled[i], scaled[(i + 1) % len(scaled)],
-                      EYE_LINE_COLOR, 1)
-    return out
+def eye_aspect_ratio(points):
+    p = points
+    vert1 = ((p[1][0] - p[5][0]) ** 2 + (p[1][1] - p[5][1]) ** 2) ** 0.5
+    vert2 = ((p[2][0] - p[4][0]) ** 2 + (p[2][1] - p[4][1]) ** 2) ** 0.5
+    horiz = ((p[0][0] - p[3][0]) ** 2 + (p[0][1] - p[3][1]) ** 2) ** 0.5
+    if horiz == 0:
+        return 0.0
+    return (vert1 + vert2) / (2.0 * horiz)
 
 
-def draw_overlay(frame, status):
-    """AI_shm status 섹션 값을 이미지 위에 텍스트로 그려서 반환."""
-    out = frame
-
-    if status is None:
-        cv2.putText(out, "NO DATA", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        return out
-
-    ear = status["ear"]
-    stage = status["stage"]
-    closed_duration = status["closed_duration_s"]
-
-    # 1초 이상 값이 갱신 안 됐으면 drowny 프로세스 문제로 간주
-    stale = (time.time() - status["timestamp"]) > 1.0
-
-    if stale:
-        label, color = "NO SIGNAL", (0, 0, 255)
-    else:
-        label, color = STAGE_LABELS.get(stage, ("UNKNOWN", (255, 255, 255)))
-
-    cv2.putText(out, f"EAR: {ear:.3f}  {label}", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-    cv2.putText(out, f"closed: {closed_duration:.2f}s", (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    cv2.putText(out, time.strftime("%Y-%m-%d %H:%M:%S"), (10, 72),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    return out
+def send_decel_warning():
+    print("[drowny] >>> DECEL/WARNING request", file=sys.stderr)
 
 
-def run_with_window(lm_reader, status_reader, sys_flag):
-    """cv2 창에 latest.jpg + 상태 오버레이 + 눈 랜드마크를 합성해서 표시."""
-    print(f"[gui] displaying {LATEST_IMAGE_PATH} in window "
-          f"'{WINDOW_NAME}' (press 'q' to quit)", file=sys.stderr)
-
-    last_mtime = None
-    last_state_print = 0.0
-
-    while True:
-        if LATEST_IMAGE_PATH.exists():
-            mtime = LATEST_IMAGE_PATH.stat().st_mtime
-            if mtime != last_mtime:
-                img = cv2.imread(str(LATEST_IMAGE_PATH))
-                if img is not None:
-                    h, w = img.shape[:2]
-                    lm_state = lm_reader.read()
-                    status = status_reader.read()
-
-                    composited = img.copy()
-                    composited = draw_landmarks(composited, lm_state, w, h)
-                    composited = draw_overlay(composited, status)
-                    cv2.imshow(WINDOW_NAME, composited)
-                last_mtime = mtime
-
-        # 상태값은 별도 주기로 콘솔에도 출력
-        now = time.time()
-        if now - last_state_print >= STATE_PRINT_INTERVAL_S:
-            status = status_reader.read()
-            sf = sys_flag.read() if sys_flag else None
-            if status is not None:
-                print(
-                    f"[gui] ear={status['ear']:.3f} "
-                    f"stage={status['stage']} "
-                    f"sleep_flag={sleep_flag_name(sf) if sf is not None else 'n/a'} "
-                    f"closed={status['closed_duration_s']:.2f}s"
-                )
-            last_state_print = now
-
-        # waitKey가 실제 창 갱신을 처리함; 'q'로 종료
-        key = cv2.waitKey(int(DISPLAY_INTERVAL_S * 1000)) & 0xFF
-        if key == ord('q'):
-            break
-
-    cv2.destroyAllWindows()
-
-
-def run_text_only(lm_reader, status_reader, sys_flag):
-    """디스플레이 없는 환경(SSH 헤드리스)용 폴백: 텍스트만 출력."""
-    print("[gui] no-window mode: printing text status only", file=sys.stderr)
-    try:
-        while True:
-            status = status_reader.read()
-            lm_state = lm_reader.read()
-            sf = sys_flag.read() if sys_flag else None
-
-            if LATEST_IMAGE_PATH.exists():
-                img_age = time.time() - LATEST_IMAGE_PATH.stat().st_mtime
-                img_status = f"latest.jpg age={img_age:.2f}s"
-            else:
-                img_status = "latest.jpg NOT FOUND"
-
-            lm_status = "landmarks=valid" if (lm_state and lm_state["valid"]) \
-                else "landmarks=none"
-
-            if status is None:
-                print(f"[gui] read failed (torn read, retry) | "
-                      f"{img_status} | {lm_status}")
-            else:
-                print(
-                    f"[gui] ear={status['ear']:.3f} "
-                    f"stage={status['stage']} "
-                    f"sleep_flag={sleep_flag_name(sf) if sf is not None else 'n/a'} "
-                    f"closed={status['closed_duration_s']:.2f}s "
-                    f"| {img_status} | {lm_status}"
-                )
-            time.sleep(STATE_PRINT_INTERVAL_S)
-    except KeyboardInterrupt:
-        pass
-
-
-def _attach_with_retry(factory, label, retries=20, interval_s=0.1):
-    """AI_init이 이 프로세스보다 늦게 뜬 경우를 대비해 짧게 재시도한다."""
-    for _ in range(retries):
-        try:
-            return factory()
-        except FileNotFoundError:
-            time.sleep(interval_s)
-    print(f"[gui] {label} attach failed. Check that AI_init is running.",
-          file=sys.stderr)
-    sys.exit(1)
+def send_clear():
+    print("[drowny] >>> CLEAR (recovered)", file=sys.stderr)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--no-window", action="store_true",
-                         help="text-only output for headless environments")
-    args = parser.parse_args()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
 
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    # 1. AI_shm(landmark/status) attach -- AI_init이 생성한 블록
+    lm_reader = None
+    for _ in range(20):
+        try:
+            lm_reader = AI_shm.LandmarkReader()
+            break
+        except FileNotFoundError:
+            time.sleep(0.1)
+    if lm_reader is None:
+        print("[drowny] AI_shm attach failed. Check that AI_init is "
+              "running.", file=sys.stderr)
+        sys.exit(1)
 
-    lm_reader = _attach_with_retry(AI_shm.LandmarkReader, "AI_shm(landmark)")
-    status_reader = _attach_with_retry(AI_shm.StatusReader, "AI_shm(status)")
+    status_writer = None
+    for _ in range(20):
+        try:
+            status_writer = AI_shm.StatusWriter()
+            break
+        except FileNotFoundError:
+            time.sleep(0.1)
+    if status_writer is None:
+        print("[drowny] AI_shm attach failed.", file=sys.stderr)
+        lm_reader.close()
+        sys.exit(1)
 
-    print("[gui] AI_shm(landmark/status) attach done", file=sys.stderr)
+    # 2. init.c의 /sys_shared_memory attach -- init_task가 먼저 떠서
+    #    shm_open(O_CREAT)로 만들어둔 뒤에만 성공함.
+    sys_shm = None
+    for _ in range(20):
+        try:
+            sys_shm = SysShmClient()
+            break
+        except FileNotFoundError:
+            time.sleep(0.1)
+    if sys_shm is None:
+        print("[drowny] /sys_shared_memory attach failed. Check that "
+              "init_task is running.", file=sys.stderr)
+        lm_reader.close()
+        status_writer.close()
+        sys.exit(1)
 
-    # init.c 시스템 공유 메모리의 sleep_flag 리더. 없어도(=init_task 미실행)
-    # 카메라 오버레이는 계속 동작하고 sleep_flag만 'n/a'로 표시한다.
+    print("[drowny] AI_shm + /sys_shared_memory attach done",
+          file=sys.stderr)
+
+    closed_since = None
+    was_drowsy = False
+
     try:
-        sys_flag = SysSleepFlag()
-        print("[gui] attached to /sys_shared_memory (sleep_flag)",
-              file=sys.stderr)
-    except FileNotFoundError:
-        sys_flag = None
-        print("[gui] /sys_shared_memory not found; sleep_flag shows 'n/a'. "
-              "Is init_task running?", file=sys.stderr)
+        while _running:
+            lm = lm_reader.read()
+            now = time.time()
 
-    try:
-        if args.no_window:
-            run_text_only(lm_reader, status_reader, sys_flag)
-        else:
-            try:
-                run_with_window(lm_reader, status_reader, sys_flag)
-            except cv2.error as e:
-                print(f"[gui] cv2 window failed ({e}); "
-                      f"falling back to text-only mode", file=sys.stderr)
-                run_text_only(lm_reader, status_reader, sys_flag)
+            if lm is None or not lm["valid"]:
+                closed_since = None
+                ear = 0.0
+                face_detected = False
+                stage = STAGE_NO_FACE
+                closed_duration = 0.0
+            else:
+                right = eye_aspect_ratio(lm["right_eye"])
+                left = eye_aspect_ratio(lm["left_eye"])
+                ear = (right + left) / 2.0
+                face_detected = True
+
+                if ear < EAR_THRESHOLD:
+                    if closed_since is None:
+                        closed_since = now
+                    closed_duration = now - closed_since
+                else:
+                    closed_since = None
+                    closed_duration = 0.0
+
+                if closed_duration >= EYES_CLOSED_DURATION_S:
+                    stage = STAGE_DROWSY
+                elif closed_duration > 0.0:
+                    stage = STAGE_WARNING
+                else:
+                    stage = STAGE_NORMAL
+
+            is_drowsy = stage == STAGE_DROWSY
+            is_warning = stage == STAGE_WARNING
+
+            status_writer.write(
+                ear=ear,
+                stage=stage,
+                face_detected=face_detected,
+                closed_duration_s=closed_duration,
+                timestamp=now,
+            )
+
+            # 시스템 공유 메모리(init.c)에는 stage를 sleep_flag로 그대로 반영
+            sys_shm.set_flags(warning=is_warning, stage=stage)
+
+            if is_drowsy and not was_drowsy:
+                send_decel_warning()
+            elif was_drowsy and not is_drowsy:
+                send_clear()
+            was_drowsy = is_drowsy
+
+            time.sleep(POLL_INTERVAL_S)
     finally:
-        lm_reader.close()      # attach만 했으므로 unlink는 AI_init 몫
-        status_reader.close()  # attach만 했으므로 unlink는 AI_init 몫
-        if sys_flag:
-            sys_flag.close()   # attach만 했으므로 unlink는 init.c 몫
-
+        print("[drowny] shutting down", file=sys.stderr)
+        lm_reader.close()
+        status_writer.close()
+        sys_shm.close()
 
 if __name__ == "__main__":
     main()
