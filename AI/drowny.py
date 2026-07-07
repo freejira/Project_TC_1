@@ -196,13 +196,16 @@ def main():
                 face_detected = False
                 stage = STAGE_NO_FACE
                 closed_duration = 0.0
+            
             else:
                 right = eye_aspect_ratio(lm["right_eye"])
                 left = eye_aspect_ratio(lm["left_eye"])
                 ear = (right + left) / 2.0
                 face_detected = True
 
-                if ear < EAR_THRESHOLD:
+                eyes_closed = (right < EAR_THRESHOLD) and (left < EAR_THRESHOLD)
+
+                if eyes_closed:
                     if closed_since is None:
                         closed_since = now
                     closed_duration = now - closed_since
