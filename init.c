@@ -58,27 +58,27 @@ typedef struct
         uint8_t power_granted;
         uint8_t module_function_enabled;
         /* Driving */
-        float target_speed_rpm;
-        float current_speed_rpm;
+        uint32_t target_speed_rpm;
+        uint32_t current_speed_rpm;
         uint16_t motor_pwm_duty;
 
         /* Power Policy */
-        float requested_power_w;
-        float granted_power_w;
-        float reported_power_w;
+        uint32_t requested_power_w;
+        uint32_t granted_power_w;
+        uint32_t reported_power_w;
         uint8_t power_violation_count;
 
         /* Module A */
-        float pressure_value;
+        uint32_t pressure_value;
 
         /* Module B */
-        float target_temp_c;
-        float current_temp_c;
+        uint32_t target_temp_c;
+        uint32_t current_temp_c;
         uint8_t peltier_pwm;
         uint8_t fan_pwm;
 
         /* Warning */
-        uint8_t warning_flag;
+        uint32_t warning_flag;
         uint8_t sleep_flag;
 } SystemSharedData_t;
 
@@ -279,4 +279,18 @@ int main(void) {
         cleanup_resources_and_kill_children();
         printf("=== System Init Task Terminated ===\n");
         return 0;
-}
+}printf("mutex=%zu total=%zu sleep_off=%zu\n",
+       sizeof(pthread_mutex_t), sizeof(SystemSharedData_t),
+       offsetof(SystemSharedData_t, sleep_flag));
+
+
+
+
+
+
+
+
+
+
+
+
