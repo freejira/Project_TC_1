@@ -82,6 +82,7 @@ typedef struct
         uint8_t sleep_flag;
 } SystemSharedData_t;
 
+
 /* --- [2. IPC 리소스 상수 정의] --- */
 #define SHM_NAME        "/sys_shared_memory"
 #define MQ_NAME         "/sys_message_queue"
@@ -279,10 +280,7 @@ int main(void) {
         cleanup_resources_and_kill_children();
         printf("=== System Init Task Terminated ===\n");
         return 0;
-}printf("mutex=%zu total=%zu sleep_off=%zu\n",
-       sizeof(pthread_mutex_t), sizeof(SystemSharedData_t),
-       offsetof(SystemSharedData_t, sleep_flag));
-
+}
 
 
 
