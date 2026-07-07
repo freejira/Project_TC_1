@@ -12,75 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 /* --- [1. 데이터 타입 및 공유 구조체 정의] --- */
-typedef enum
-{
-        SYS_IDLE = 0,
-        SYS_IDENTIFY,
-        SYS_AUTHENTICATE,
-        SYS_NEGOTIATE,
-        SYS_ACTIVE,
-        SYS_FAULT,
-        SYS_QUARANTINE
-} SystemState_t;
-
-typedef enum
-{
-        FAULT_NONE = 0,
-        FAULT_IDENTIFY_TIMEOUT,
-        FAULT_AUTH_FAIL,
-        FAULT_AUTH_TIMEOUT,
-        FAULT_POWER_REJECT,
-        FAULT_NEGOTIATE_TIMEOUT,
-        FAULT_POWER_VIOLATION_MAX
-} FaultCode_t;
-
-typedef enum
-{
-        MODULE_NONE = 0,
-        MODULE_GENERAL,      // Module A: 일반 배송 모듈
-        MODULE_COLD_CHAIN,   // Module B: 냉장 배송 모듈
-        MODULE_UNKNOWN       // 등록되지 않았거나 알 수 없는 모듈
-} ModuleType_t;
-
-typedef struct
-{
-        pthread_mutex_t mutex;  // 프로세스 간 공유할 뮤텍스
-
-        /* System State */
-        SystemState_t system_state;
-        ModuleType_t module_type;
-        FaultCode_t latest_fault;
-
-        uint32_t module_id;
-
-        uint8_t dock_detected;
-        uint8_t auth_result;
-        uint8_t power_granted;
-        uint8_t module_function_enabled;
-        /* Driving */
-        uint32_t target_speed_rpm;
-        uint32_t current_speed_rpm;
-        uint16_t motor_pwm_duty;
-
-        /* Power Policy */
-        uint32_t requested_power_w;
-        uint32_t granted_power_w;
-        uint32_t reported_power_w;
-        uint8_t power_violation_count;
-
-        /* Module A */
-        uint32_t pressure_value;
-
-        /* Module B */
-        uint32_t target_temp_c;
-        uint32_t current_temp_c;
-        uint8_t peltier_pwm;
-        uint8_t fan_pwm;
-
-        /* Warning */
-        uint32_t warning_flag;
-        uint8_t sleep_flag;
-} SystemSharedData_t;
+`
 
 /* --- [2. IPC 리소스 상수 정의] --- */
 #define SHM_NAME        "/sys_shared_memory"
@@ -96,11 +28,11 @@ typedef struct {
 } ProcessInfo;
 
 static ProcessInfo g_processes[] = {
-        // {"gui_proc",  "./gui_proc",  -1},
-        {"ai_proc",   "python AI_init.py",   -1},
-        // {"sec_proc",  "./sec_proc",  -1},
-        // {"comm_proc", "./comm_proc", -1},
-        // {"log_proc", "./log_proc", -1}
+        {"gui_proc",  "./gui_proc",  -1},
+        {"ai_proc",   "./ai_proc",   -1},
+        {"sec_proc",  "./sec_proc",  -1},
+        {"comm_proc", "./comm_proc", -1},
+        {"log_proc", "./log_proc", -1}
 };
 const int NUM_PROCESSES = sizeof(g_processes) / sizeof(g_processes[0]);
 
@@ -202,23 +134,13 @@ pid_t spawn_process(ProcessInfo *proc) {
         return -1;
         }
         else if (pid == 0) {
+                /* [Child Process] */
                 printf("[CHILD] Executing %s (%s)...\n", proc->name, proc->path);
+                /* 현재 디렉토리("./")에서 바이너리 실행 */
+                execl(proc->path, proc->name, (char *)NULL);
 
-                if (strcmp(proc->name, "ai_proc") == 0) {
-                        const char *home = getenv("HOME");
-                        char py[256], script[256];
-                        snprintf(py, sizeof(py),
-                                "%s/drowsy_env_312/bin/python", home ? home : "");
-                        snprintf(script, sizeof(script),
-                                "%s/my/AI/AI_init.py", home ? home : "");
-                        execl(py, py, script, (char *)NULL);
-                        fprintf(stderr, "[CHILD CRITICAL] Failed to exec %s %s: %s\n",
-                                py, script, strerror(errno));
-                } else {
-                        execl(proc->path, proc->name, (char *)NULL);
-                        fprintf(stderr, "[CHILD CRITICAL] Failed to exec %s: %s\n",
-                                proc->path, strerror(errno));
-                }
+                /* 실행 실패 시 에러 출력 및 자식 즉시 종료 */
+                fprintf(stderr, "[CHILD CRITICAL] Failed to exec %s: %s\n", proc->path, strerror(errno));
                 exit(EXIT_FAILURE);
         }
 
@@ -279,18 +201,4 @@ int main(void) {
         cleanup_resources_and_kill_children();
         printf("=== System Init Task Terminated ===\n");
         return 0;
-}printf("mutex=%zu total=%zu sleep_off=%zu\n",
-       sizeof(pthread_mutex_t), sizeof(SystemSharedData_t),
-       offsetof(SystemSharedData_t, sleep_flag));
-
-
-
-
-
-
-
-
-
-
-
-
+}
