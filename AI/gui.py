@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 import cv2
+import ctypes
 import mmap
 import os
 
@@ -31,23 +32,72 @@ import AI_shm
 SYS_SHM_PATH = "/dev/shm/sys_shared_memory"
 
 
-class SysSleepFlag:
-    """init.c의 /sys_shared_memory에서 sleep_flag(마지막 바이트)만 read.
+class _PthreadMutexRaw(ctypes.Structure):
+    _fields_ = [("_opaque", ctypes.c_uint8 * 48)]
 
-    sleep_flag는 SystemSharedData_t의 맨 끝 필드(그 앞=warning_flag)라서,
-    ftruncate된 파일 크기의 마지막 바이트가 곧 sleep_flag다. drowny.py가
-    여기에 AI_STATE_*(0~5)를 그대로 써 넣는다. uint8 단일 바이트 read는
-    원자적이므로 뮤텍스가 필요 없다. 생성/해제는 init.c 담당 -- 여기서는
-    close만 하고 unlink하지 않는다."""
+
+class _SystemSharedData(ctypes.Structure):
+    """init.c의 SystemSharedData_t와 1:1 대응 -- sleep_flag의 실제
+    바이트 오프셋을 계산하기 위한 용도로만 쓴다 (읽기/쓰기 자체는 안 함).
+
+    주의: drowny.py의 SystemSharedData와 반드시 같은 필드 순서/타입을
+    유지해야 한다. 예전에는 이런 struct 없이 "파일의 마지막 바이트 =
+    sleep_flag"라고 가정했는데, 구조체 끝에 컴파일러가 붙이는 정렬
+    패딩 때문에 실제로는 sleep_flag가 아니라 패딩 바이트를 읽고 있었다
+    (sleep_flag_reader.c로 실측 확인된 버그, drowny.py 쪽 쓰기 버그와
+    같은 종류). 이제는 진짜 오프셋을 계산해서 그 위치만 읽는다."""
+    _fields_ = [
+        ("mutex", _PthreadMutexRaw),
+        ("system_state", ctypes.c_int),
+        ("module_type", ctypes.c_int),
+        ("latest_fault", ctypes.c_int),
+        ("module_id", ctypes.c_uint32),
+        ("dock_detected", ctypes.c_uint8),
+        ("auth_result", ctypes.c_uint8),
+        ("power_granted", ctypes.c_uint8),
+        ("module_function_enabled", ctypes.c_uint8),
+        ("target_speed_rpm", ctypes.c_uint32),
+        ("current_speed_rpm", ctypes.c_uint32),
+        ("motor_pwm_duty", ctypes.c_uint16),
+        ("requested_power_w", ctypes.c_uint32),
+        ("granted_power_w", ctypes.c_uint32),
+        ("reported_power_w", ctypes.c_uint32),
+        ("power_violation_count", ctypes.c_uint8),
+        ("pressure_value", ctypes.c_uint32),
+        ("target_temp_c", ctypes.c_uint32),
+        ("current_temp_c", ctypes.c_uint32),
+        ("peltier_pwm", ctypes.c_uint8),
+        ("fan_pwm", ctypes.c_uint8),
+        ("warning_flag", ctypes.c_uint32),
+        ("sleep_flag", ctypes.c_uint8),
+    ]
+
+
+_SLEEP_FLAG_OFFSET = _SystemSharedData.sleep_flag.offset
+
+
+class SysSleepFlag:
+    """init.c의 /sys_shared_memory에서 sleep_flag 1바이트만 read.
+
+    _SystemSharedData ctypes 정의로 계산한 실제 오프셋(_SLEEP_FLAG_OFFSET)
+    위치만 읽는다. uint8 단일 바이트 read는 원자적이므로 뮤텍스는 필요
+    없다. 생성/해제는 init.c 담당 -- 여기서는 close만 하고 unlink하지
+    않는다."""
 
     def __init__(self):
         fd = os.open(SYS_SHM_PATH, os.O_RDONLY)
-        self._size = os.fstat(fd).st_size
-        self._mm = mmap.mmap(fd, self._size, prot=mmap.PROT_READ)
+        size = os.fstat(fd).st_size
+        if _SLEEP_FLAG_OFFSET >= size:
+            os.close(fd)
+            raise ValueError(
+                f"sleep_flag offset({_SLEEP_FLAG_OFFSET}) >= shm size({size}); "
+                f"init.c의 SystemSharedData_t와 여기 _SystemSharedData 정의가 "
+                f"어긋났을 수 있음")
+        self._mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
         os.close(fd)
 
     def read(self):
-        return self._mm[self._size - 1]   # 마지막 바이트 == sleep_flag
+        return self._mm[_SLEEP_FLAG_OFFSET]
 
     def close(self):
         self._mm.close()
