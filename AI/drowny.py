@@ -31,6 +31,18 @@ AI_state (0~5) 정의:
 주의: init.c/STM32 쪽 struct 필드명은 여전히 sleep_flag이지만, 이제
 0/1 불리언이 아니라 위 0~5 AI_state 값을 그대로 담는다. STM32 측 트리거
 조건(부저: AI_state==3, LED+감속: AI_state==4)은 별도 작업으로 반영 예정.
+
+FIXED (sleep_flag_reader.c로 실측 확인된 버그): SystemSharedData ctypes
+mirror에서 warning_flag를 c_uint8(1바이트)로 잘못 선언했었다 --
+init.c 실제 타입은 uint32_t(4바이트)라서, 그 뒤에 오는 sleep_flag의
+Python 오프셋이 실제 C 오프셋보다 앞쪽(컴파일러 패딩 영역)으로
+계산되고 있었다. 즉 이 파일이 sleep_flag/warning_flag를 쓴다고
+"믿고" 있었지만 실제로는 아무도 읽지 않는 패딩 바이트에 쓰고 있었고,
+진짜 sleep_flag 필드는 항상 0(초기값)으로 남아있었다 -- STM32가
+드로우시니스 이벤트에 전혀 반응하지 않았던 근본 원인. target_speed_rpm
+등도 init.c에서는 uint32_t인데 c_float로 잘못 선언돼 있어서 크기는
+맞았지만(둘 다 4바이트) 값 해석 자체가 틀렸었다 -- 전부 실제 타입에
+맞춰 수정함.
 """
 
 import ctypes
@@ -54,6 +66,14 @@ class PthreadMutexRaw(ctypes.Structure):
 
 
 class SystemSharedData(ctypes.Structure):
+    # 주의: 아래 타입은 init.c의 SystemSharedData_t와 반드시 1:1로
+    # 동일해야 한다. 예전 버전은 target_speed_rpm 등을 c_float로,
+    # warning_flag를 c_uint8(1바이트)로 잘못 선언했었다 -- init.c에서는
+    # 전부 uint32_t다. 특히 warning_flag가 실제로는 4바이트인데 여기서
+    # 1바이트로 계산되면, 그 뒤에 오는 sleep_flag의 오프셋이 실제 위치
+    # (구조체 패딩 때문에 몇 바이트 뒤)보다 앞으로 밀려서, 여기서 쓰는
+    # sleep_flag/warning_flag가 진짜 필드가 아니라 컴파일러 패딩 바이트에
+    # 쓰이는 결과가 됐었다 (sleep_flag_reader.c로 실측 확인된 버그).
     _fields_ = [
         ("mutex", PthreadMutexRaw),
         ("system_state", ctypes.c_int),
@@ -64,19 +84,19 @@ class SystemSharedData(ctypes.Structure):
         ("auth_result", ctypes.c_uint8),
         ("power_granted", ctypes.c_uint8),
         ("module_function_enabled", ctypes.c_uint8),
-        ("target_speed_rpm", ctypes.c_float),
-        ("current_speed_rpm", ctypes.c_float),
+        ("target_speed_rpm", ctypes.c_uint32),
+        ("current_speed_rpm", ctypes.c_uint32),
         ("motor_pwm_duty", ctypes.c_uint16),
-        ("requested_power_w", ctypes.c_float),
-        ("granted_power_w", ctypes.c_float),
-        ("reported_power_w", ctypes.c_float),
+        ("requested_power_w", ctypes.c_uint32),
+        ("granted_power_w", ctypes.c_uint32),
+        ("reported_power_w", ctypes.c_uint32),
         ("power_violation_count", ctypes.c_uint8),
-        ("pressure_value", ctypes.c_float),
-        ("target_temp_c", ctypes.c_float),
-        ("current_temp_c", ctypes.c_float),
+        ("pressure_value", ctypes.c_uint32),
+        ("target_temp_c", ctypes.c_uint32),
+        ("current_temp_c", ctypes.c_uint32),
         ("peltier_pwm", ctypes.c_uint8),
         ("fan_pwm", ctypes.c_uint8),
-        ("warning_flag", ctypes.c_uint8),
+        ("warning_flag", ctypes.c_uint32),   # was c_uint8 -- real bug
         ("sleep_flag", ctypes.c_uint8),   # now holds AI_state (0~5)
     ]
 
@@ -99,9 +119,10 @@ class SysShmClient:
     def _unlock(self):
         libpthread.pthread_mutex_unlock(ctypes.byref(self._data.mutex))
 
-    def read_current_speed_rpm(self) -> float:
-        # Common STM(F429ZI)이 CAN으로 보고하는 실측 속도. AI_state==
-        # SLEEP_EST 상태에서 정차 여부(STOPPED 승격) 판단에 쓴다.
+    def read_current_speed_rpm(self) -> int:
+        # Common STM(F429ZI)이 CAN으로 보고하는 실측 속도(정수 RPM,
+        # init.c에서 uint32_t). AI_state==SLEEP_EST 상태에서 정차 여부
+        # (STOPPED 승격) 판단에 쓴다.
         self._lock()
         try:
             return self._data.current_speed_rpm
