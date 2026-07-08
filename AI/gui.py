@@ -36,7 +36,7 @@ class SysSleepFlag:
 
     sleep_flag는 SystemSharedData_t의 맨 끝 필드(그 앞=warning_flag)라서,
     ftruncate된 파일 크기의 마지막 바이트가 곧 sleep_flag다. drowny.py가
-    여기에 STAGE_*(0~3)를 그대로 써 넣는다. uint8 단일 바이트 read는
+    여기에 AI_STATE_*(0~5)를 그대로 써 넣는다. uint8 단일 바이트 read는
     원자적이므로 뮤텍스가 필요 없다. 생성/해제는 init.c 담당 -- 여기서는
     close만 하고 unlink하지 않는다."""
 
@@ -64,25 +64,31 @@ EYE_POINT_RADIUS = 2
 EYE_POINT_COLOR = (0, 255, 255)     # yellow dots on each landmark
 EYE_LINE_COLOR = (255, 255, 0)      # cyan contour connecting the 6 points
 
-# drowny.py와 합의된 stage 코드
-STAGE_NO_FACE = 0
-STAGE_NORMAL = 1
-STAGE_WARNING = 2
-STAGE_DROWSY = 3
+# drowny.py와 합의된 AI_state 코드 (0~5)
+AI_STATE_NO_FACE = 0
+AI_STATE_FACE_OK = 1
+AI_STATE_EYE_CLOSING = 2
+AI_STATE_DROWSY_EST = 3
+AI_STATE_SLEEP_EST = 4
+AI_STATE_STOPPED = 5
 
 STAGE_LABELS = {
-    STAGE_NO_FACE: ("NO FACE", (0, 165, 255)),
-    STAGE_NORMAL: ("FACE OK", (0, 200, 0)),
-    STAGE_WARNING: ("EYES CLOSING", (0, 165, 255)),
-    STAGE_DROWSY: ("DROWSY", (0, 0, 255)),
+    AI_STATE_NO_FACE: ("NO FACE", (0, 165, 255)),
+    AI_STATE_FACE_OK: ("FACE OK", (0, 200, 0)),
+    AI_STATE_EYE_CLOSING: ("EYES CLOSING", (0, 255, 255)),
+    AI_STATE_DROWSY_EST: ("DROWSY (BUZZER)", (0, 140, 255)),
+    AI_STATE_SLEEP_EST: ("SLEEP (LED+DECEL)", (0, 0, 255)),
+    AI_STATE_STOPPED: ("STOPPED", (255, 0, 0)),
 }
 
-# sleep_flag(=init.c로 반영된 stage) 콘솔 출력용 이름
+# sleep_flag(=init.c로 반영된 AI_state) 콘솔 출력용 이름
 SLEEP_FLAG_NAME = {
-    STAGE_NO_FACE: "NO_FACE",
-    STAGE_NORMAL: "NORMAL",
-    STAGE_WARNING: "WARNING",
-    STAGE_DROWSY: "DROWSY",
+    AI_STATE_NO_FACE: "NO_FACE",
+    AI_STATE_FACE_OK: "FACE_OK",
+    AI_STATE_EYE_CLOSING: "EYE_CLOSING",
+    AI_STATE_DROWSY_EST: "DROWSY_EST",
+    AI_STATE_SLEEP_EST: "SLEEP_EST",
+    AI_STATE_STOPPED: "STOPPED",
 }
 
 
