@@ -1,18 +1,36 @@
 """drowny.py: AI_shm의 landmark 섹션에서 눈 랜드마크 좌표를 읽어 EAR을
-계산하고, 벽시계 시간 기반으로 졸음을 판정해 AI_shm의 status 섹션에
-기록한다. 판정이 바뀌는 시점(rising/falling edge)에 Main STM32로
-경고/감속 요청 및 해제 신호를 보낸다.
+계산하고, 벽시계 시간 기반으로 AI_state(0~5)를 판정해 AI_shm의 status
+섹션과 init.c의 sys_shared_memory(sleep_flag 필드)에 기록한다. 판정이
+바뀌는 시점(rising/falling edge)에 Main STM32로 경고/감속 요청 및 해제
+신호를 보낸다.
 
 위치: 코드 전체가 모여있는 폴더 (예: ~/my/AI/drowny.py)
 실행: <코드 폴더>/drowsy_env_312/bin/python drowny.py
 
 책임 범위:
   - 하는 일: 랜드마크 읽기 -> EAR 계산 -> 눈 감김 지속시간 판정 ->
-    상태 write -> (rising/falling edge에서) STM32에 경고/해제 전송
+    AI_state 결정 -> 상태 write -> (rising/falling edge에서) STM32에
+    경고/해제 전송
 
 AI_shm 사용 범위: landmark 섹션을 읽고(AI_shm.LandmarkReader), status
 섹션에 씀(AI_shm.StatusWriter). 생성/해제는 AI_init 담당 -- close()는
 mmap만 닫고 unlink하지 않는다.
+
+AI_state (0~5) 정의:
+  0 NO_FACE     : 얼굴 파악 안됨
+  1 FACE_OK     : 얼굴(눈) 감지, 정상
+  2 EYE_CLOSING : 눈 감김 (0~1초) -- 카운터 시작
+  3 DROWSY_EST  : 졸음 추정 (1~3.5초) -- 부저 작동
+  4 SLEEP_EST   : 취침 추정 (3.5초 이상) -- LED 점등 + 감속 시작
+  5 STOPPED     : 정차 이후. AI_state==4(SLEEP_EST)인 동안 공유 메모리의
+                  current_speed_rpm을 읽어 0까지 떨어진 것을 확인하면
+                  drowny.py가 자체적으로 5로 승격시킨다. 감속 자체는
+                  Common STM 담당, drowny.py는 결과(속도==0)만 읽어서
+                  반영한다.
+
+주의: init.c/STM32 쪽 struct 필드명은 여전히 sleep_flag이지만, 이제
+0/1 불리언이 아니라 위 0~5 AI_state 값을 그대로 담는다. STM32 측 트리거
+조건(부저: AI_state==3, LED+감속: AI_state==4)은 별도 작업으로 반영 예정.
 """
 
 import ctypes
@@ -59,7 +77,7 @@ class SystemSharedData(ctypes.Structure):
         ("peltier_pwm", ctypes.c_uint8),
         ("fan_pwm", ctypes.c_uint8),
         ("warning_flag", ctypes.c_uint8),
-        ("sleep_flag", ctypes.c_uint8),
+        ("sleep_flag", ctypes.c_uint8),   # now holds AI_state (0~5)
     ]
 
 
@@ -81,14 +99,23 @@ class SysShmClient:
     def _unlock(self):
         libpthread.pthread_mutex_unlock(ctypes.byref(self._data.mutex))
 
-    def set_flags(self, warning: bool, stage: int):
-        # sleep_flag에는 drowny stage(STAGE_*, 0~3)를 그대로 기록한다.
+    def read_current_speed_rpm(self) -> float:
+        # Common STM(F429ZI)이 CAN으로 보고하는 실측 속도. AI_state==
+        # SLEEP_EST 상태에서 정차 여부(STOPPED 승격) 판단에 쓴다.
+        self._lock()
+        try:
+            return self._data.current_speed_rpm
+        finally:
+            self._unlock()
+
+    def set_flags(self, warning: bool, ai_state: int):
+        # sleep_flag 필드에는 AI_state(0~5)를 그대로 기록한다.
         # 주의: 소비 측(C/STM32)은 sleep_flag를 0/1 불리언이 아니라
-        # 0~3 단계값으로 읽어야 한다 (졸음 판정은 sleep_flag == STAGE_DROWSY(3)).
+        # 0~5 단계값으로 읽어야 한다.
         self._lock()
         try:
             self._data.warning_flag = 1 if warning else 0
-            self._data.sleep_flag = int(stage) & 0xFF
+            self._data.sleep_flag = int(ai_state) & 0xFF
         finally:
             self._unlock()
 
@@ -100,13 +127,17 @@ class SysShmClient:
 # 튜닝 파라미터
 # ---------------------------------------------------------------------------
 EAR_THRESHOLD = 0.21
-EYES_CLOSED_DURATION_S = 3.0
+DROWSY_EST_THRESHOLD_S = 1.0    # 이 시간 이상 감으면 EYE_CLOSING -> DROWSY_EST
+SLEEP_EST_THRESHOLD_S = 3.5     # 이 시간 이상 감으면 DROWSY_EST -> SLEEP_EST
+STOPPED_SPEED_EPSILON_RPM = 0.5  # 이 이하면 current_speed_rpm==0으로 간주
 POLL_INTERVAL_S = 0.05
 
-STAGE_NO_FACE = 0
-STAGE_NORMAL = 1
-STAGE_WARNING = 2
-STAGE_DROWSY = 3
+AI_STATE_NO_FACE = 0
+AI_STATE_FACE_OK = 1
+AI_STATE_EYE_CLOSING = 2
+AI_STATE_DROWSY_EST = 3
+AI_STATE_SLEEP_EST = 4
+AI_STATE_STOPPED = 5   # SLEEP_EST + current_speed_rpm==0일 때 승격
 
 _running = True
 
@@ -127,11 +158,12 @@ def eye_aspect_ratio(points):
 
 
 def send_decel_warning():
-    print("[drowny] >>> DECEL/WARNING request", file=sys.stderr)
+    print("[drowny] >>> DECEL/WARNING request (SLEEP_EST entered)",
+          file=sys.stderr)
 
 
 def send_clear():
-    print("[drowny] >>> CLEAR (recovered)", file=sys.stderr)
+    print("[drowny] >>> CLEAR (recovered from SLEEP_EST)", file=sys.stderr)
 
 
 def main():
@@ -183,7 +215,7 @@ def main():
           file=sys.stderr)
 
     closed_since = None
-    was_drowsy = False
+    was_elevated = False
 
     try:
         while _running:
@@ -194,9 +226,9 @@ def main():
                 closed_since = None
                 ear = 0.0
                 face_detected = False
-                stage = STAGE_NO_FACE
+                ai_state = AI_STATE_NO_FACE
                 closed_duration = 0.0
-            
+
             else:
                 right = eye_aspect_ratio(lm["right_eye"])
                 left = eye_aspect_ratio(lm["left_eye"])
@@ -213,32 +245,44 @@ def main():
                     closed_since = None
                     closed_duration = 0.0
 
-                if closed_duration >= EYES_CLOSED_DURATION_S:
-                    stage = STAGE_DROWSY
+                if closed_duration >= SLEEP_EST_THRESHOLD_S:
+                    ai_state = AI_STATE_SLEEP_EST
+                elif closed_duration >= DROWSY_EST_THRESHOLD_S:
+                    ai_state = AI_STATE_DROWSY_EST
                 elif closed_duration > 0.0:
-                    stage = STAGE_WARNING
+                    ai_state = AI_STATE_EYE_CLOSING
                 else:
-                    stage = STAGE_NORMAL
+                    ai_state = AI_STATE_FACE_OK
 
-            is_drowsy = stage == STAGE_DROWSY
-            is_warning = stage == STAGE_WARNING
+            # SLEEP_EST 상태에서 실제로 속도가 0까지 떨어졌으면 STOPPED로 승격.
+            # (감속 자체는 STM32 쪽 작업 -- 여기서는 결과만 읽어서 반영)
+            if ai_state == AI_STATE_SLEEP_EST:
+                current_speed = sys_shm.read_current_speed_rpm()
+                if abs(current_speed) <= STOPPED_SPEED_EPSILON_RPM:
+                    ai_state = AI_STATE_STOPPED
+
+            # SLEEP_EST/STOPPED 둘 다 "고조 상태"로 취급 -- STOPPED로 승격돼도
+            # decel/warning 해제(send_clear)가 잘못 발생하지 않도록 함께 본다.
+            is_elevated = ai_state in (AI_STATE_SLEEP_EST, AI_STATE_STOPPED)
+            is_buzzer = ai_state == AI_STATE_DROWSY_EST   # 부저 트리거 비트
 
             status_writer.write(
                 ear=ear,
-                stage=stage,
+                stage=ai_state,
                 face_detected=face_detected,
                 closed_duration_s=closed_duration,
                 timestamp=now,
             )
 
-            # 시스템 공유 메모리(init.c)에는 stage를 sleep_flag로 그대로 반영
-            sys_shm.set_flags(warning=is_warning, stage=stage)
+            # 시스템 공유 메모리(init.c)의 sleep_flag 필드에는 AI_state를
+            # 그대로 반영. warning_flag는 부저(DROWSY_EST) 트리거 비트.
+            sys_shm.set_flags(warning=is_buzzer, ai_state=ai_state)
 
-            if is_drowsy and not was_drowsy:
+            if is_elevated and not was_elevated:
                 send_decel_warning()
-            elif was_drowsy and not is_drowsy:
+            elif was_elevated and not is_elevated:
                 send_clear()
-            was_drowsy = is_drowsy
+            was_elevated = is_elevated
 
             time.sleep(POLL_INTERVAL_S)
     finally:
@@ -246,6 +290,7 @@ def main():
         lm_reader.close()
         status_writer.close()
         sys_shm.close()
+
 
 if __name__ == "__main__":
     main()
