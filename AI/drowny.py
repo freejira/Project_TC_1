@@ -32,6 +32,24 @@ AI_state (0~5) 정의:
 0/1 불리언이 아니라 위 0~5 AI_state 값을 그대로 담는다. STM32 측 트리거
 조건(부저: AI_state==3, LED+감속: AI_state==4)은 별도 작업으로 반영 예정.
 
+저속 예외 (LOW_SPEED_THRESHOLD_RPM, 20):
+  - current_speed_rpm(RPM) 값이 20 미만인 저속 구간에서는
+    EYE_CLOSING(2)/DROWSY_EST(3) 판정을 적용하지 않는다 (아래 3단계
+    임계값 근거의 Seeing Machines Guardian, 현대 등 상용 기준의
+    저속 컷오프 20km/h 상당을 RPM 기준으로 채택). km/h 환산은 하지
+    않고 RPM 값을 그대로 비교한다.
+  - SLEEP_EST(4)는 이 저속 기준에서 제외한다 -- 이미 감속(decel)이
+    진행 중인 상태이므로, 감속으로 RPM이 20 밑으로 내려가는 순간
+    "저속이니 졸음 아님"으로 오판해서 4단계가 풀려버리면 안 되기 때문.
+
+상태 전이 제한:
+  - 2(EYE_CLOSING)/3(DROWSY_EST)/4(SLEEP_EST) 상태에서는 1(FACE_OK, 완전
+    회복)로 내려가거나, 현재보다 높은 단계로 올라가는 것만 허용한다.
+    즉 3->2, 4->3처럼 한 틱짜리 EAR 노이즈로 인한 임의 하향(flicker)은
+    막는다.
+  - 단 NO_FACE(0)는 카메라가 얼굴/눈 자체를 잃어버린 별개의 신호
+    상실 이벤트이므로 이 규칙과 무관하게 항상 즉시 반영된다.
+
 FIXED (sleep_flag_reader.c로 실측 확인된 버그): SystemSharedData ctypes
 mirror에서 warning_flag를 c_uint8(1바이트)로 잘못 선언했었다 --
 init.c 실제 타입은 uint32_t(4바이트)라서, 그 뒤에 오는 sleep_flag의
@@ -153,12 +171,24 @@ SLEEP_EST_THRESHOLD_S = 3.5     # 이 시간 이상 감으면 DROWSY_EST -> SLEE
 STOPPED_SPEED_EPSILON_RPM = 0.5  # 이 이하면 current_speed_rpm==0으로 간주
 POLL_INTERVAL_S = 0.05
 
+# 저속 컷오프 -- 상용 졸음 감지 제품/현대 등의 저속 기준(20km/h 상당)을
+# 채택. 이 미만에서는 EYE_CLOSING/DROWSY_EST 판정을 적용하지 않는다.
+# (SLEEP_EST(4)는 감속 진행 중이므로 이 기준에서 제외됨 -- 메인 루프 참고)
+# current_speed_rpm(RPM) 값을 그대로 비교한다 -- km/h 환산 없음.
+LOW_SPEED_THRESHOLD_RPM = 20
+
+
 AI_STATE_NO_FACE = 0
 AI_STATE_FACE_OK = 1
 AI_STATE_EYE_CLOSING = 2
 AI_STATE_DROWSY_EST = 3
 AI_STATE_SLEEP_EST = 4
 AI_STATE_STOPPED = 5   # SLEEP_EST + current_speed_rpm==0일 때 승격
+
+# 이 상태들에 있는 동안은 1(FACE_OK)로 회복하거나 상위 단계로 올라가는
+# 것만 허용 (임의 하향/flicker 방지). NO_FACE(0)는 예외 -- 항상 즉시 반영.
+_MONOTONIC_STATES = (AI_STATE_EYE_CLOSING, AI_STATE_DROWSY_EST,
+                      AI_STATE_SLEEP_EST)
 
 _running = True
 
@@ -237,17 +267,28 @@ def main():
 
     closed_since = None
     was_elevated = False
+    current_stage = AI_STATE_NO_FACE   # 직전 틱의 확정 AI_state (전이 제한용)
 
     try:
         while _running:
             lm = lm_reader.read()
             now = time.time()
 
+            # 매 틱 속도(RPM)를 읽는다 -- 저속 게이팅(EYE_CLOSING/DROWSY_EST
+            # 미적용 여부)과 기존 STOPPED 승격 판단 양쪽에 필요.
+            current_speed_rpm = sys_shm.read_current_speed_rpm()
+            # SLEEP_EST(4)/STOPPED(5)는 저속 예외 대상 -- 감속 진행 중
+            # 속도가 떨어지는 것 자체로 "저속이니 졸음 아님"이 되어버리는
+            # 것을 막는다.
+            low_speed = (abs(current_speed_rpm) < LOW_SPEED_THRESHOLD_RPM
+                         and current_stage not in (AI_STATE_SLEEP_EST,
+                                                    AI_STATE_STOPPED))
+
             if lm is None or not lm["valid"]:
                 closed_since = None
                 ear = 0.0
                 face_detected = False
-                ai_state = AI_STATE_NO_FACE
+                raw_state = AI_STATE_NO_FACE
                 closed_duration = 0.0
 
             else:
@@ -266,21 +307,42 @@ def main():
                     closed_since = None
                     closed_duration = 0.0
 
-                if closed_duration >= SLEEP_EST_THRESHOLD_S:
-                    ai_state = AI_STATE_SLEEP_EST
+                if low_speed:
+                    # 저속: 눈 감김 지속시간과 무관하게 졸음 판정 자체를
+                    # 적용하지 않는다 (타이머는 계속 흐르게 두되, 이 틱의
+                    # 판정만 FACE_OK로 억제).
+                    raw_state = AI_STATE_FACE_OK
+                elif closed_duration >= SLEEP_EST_THRESHOLD_S:
+                    raw_state = AI_STATE_SLEEP_EST
                 elif closed_duration >= DROWSY_EST_THRESHOLD_S:
-                    ai_state = AI_STATE_DROWSY_EST
+                    raw_state = AI_STATE_DROWSY_EST
                 elif closed_duration > 0.0:
-                    ai_state = AI_STATE_EYE_CLOSING
+                    raw_state = AI_STATE_EYE_CLOSING
                 else:
-                    ai_state = AI_STATE_FACE_OK
+                    raw_state = AI_STATE_FACE_OK
+
+            # ---- 상태 전이 제한 ------------------------------------
+            # 2/3/4단계에 있는 동안은 1단계(FACE_OK, 완전 회복)로 내려
+            # 가거나 현재보다 높은 단계로 올라가는 것만 허용한다.
+            # NO_FACE(0)는 얼굴 자체 상실이므로 이 규칙과 무관하게
+            # 항상 즉시 반영한다.
+            if not face_detected:
+                ai_state = AI_STATE_NO_FACE
+            elif current_stage in _MONOTONIC_STATES:
+                if raw_state == AI_STATE_FACE_OK or raw_state > current_stage:
+                    ai_state = raw_state
+                else:
+                    ai_state = current_stage   # 임의 하향 무시 -- 유지
+            else:
+                ai_state = raw_state
 
             # SLEEP_EST 상태에서 실제로 속도가 0까지 떨어졌으면 STOPPED로 승격.
             # (감속 자체는 STM32 쪽 작업 -- 여기서는 결과만 읽어서 반영)
             if ai_state == AI_STATE_SLEEP_EST:
-                current_speed = sys_shm.read_current_speed_rpm()
-                if abs(current_speed) <= STOPPED_SPEED_EPSILON_RPM:
+                if abs(current_speed_rpm) <= STOPPED_SPEED_EPSILON_RPM:
                     ai_state = AI_STATE_STOPPED
+
+            current_stage = ai_state
 
             # SLEEP_EST/STOPPED 둘 다 "고조 상태"로 취급 -- STOPPED로 승격돼도
             # decel/warning 해제(send_clear)가 잘못 발생하지 않도록 함께 본다.
