@@ -20,8 +20,8 @@ AI_state (0~5) 정의:
   0 NO_FACE     : 얼굴 파악 안됨
   1 FACE_OK     : 얼굴(눈) 감지, 정상
   2 EYE_CLOSING : 눈 감김 (0~1초) -- 카운터 시작
-  3 DROWSY_EST  : 졸음 추정 (1~3.5초) -- 부저 작동
-  4 SLEEP_EST   : 취침 추정 (3.5초 이상) -- LED 점등 + 감속 시작
+  3 DROWSY_EST  : 졸음 추정 (1~3초) -- 부저 작동
+  4 SLEEP_EST   : 취침 추정 (3초 이상) -- LED 점등 + 감속 시작
   5 STOPPED     : 정차 이후. AI_state==4(SLEEP_EST)인 동안 공유 메모리의
                   current_speed_rpm을 읽어 0까지 떨어진 것을 확인하면
                   drowny.py가 자체적으로 5로 승격시킨다. 감속 자체는
